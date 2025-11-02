@@ -25,3 +25,6 @@ build/
 # --- Misc you definitely don't want ---
 .nvm/
 Library/
+.nvm/
+Library/
+.DS_Store
