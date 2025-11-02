@@ -38,7 +38,7 @@ TOOLS = [
   # NEW composite tool
   {"type":"function","function":{
     "name":"nearby_search_with_walk",
-    "description":"Search nearby places and include walking time from the origin.",
+    "description":"Search nearby places and include walking time from the origin. Preferred for nearby queries.",
     "parameters":{"type":"object","properties":{
       "query":{"type":"string"},
       "origin_lat":{"type":"number"},
@@ -50,7 +50,8 @@ TOOLS = [
 
 SYSTEM = (
   "You are a travel/concierge agent. When the user asks for places near coordinates, cafes, landmarks, or distances, "
-  "you MUST call the appropriate tools and never guess. Be concise; show distances and links if available."
+  "you MUST call the tools and NEVER guess. If the tool returns fields like distance_km and duration_min, "
+  "you MUST display those values verbatim without recomputing or changing units."
 )
 
 async def run_agent(user_msg: str) -> str:
@@ -96,6 +97,23 @@ async def run_agent(user_msg: str) -> str:
             "name": name,
             "content": json.dumps(out)
         })
+
+    # >>> THIS IS THE BLOCK YOU WERE ASKING ABOUT <<<
+    # If the model called the composite tool, format a reliable answer ourselves
+    only_one = len(assistant_msg.tool_calls) == 1
+    if only_one and assistant_msg.tool_calls[0].function.name == "nearby_search_with_walk":
+        payload = json.loads(tool_messages[0]["content"])  # {"cards":[...], "origin": {...}}
+        cards = payload.get("cards", [])
+        if not cards:
+            return "No results found."
+        lines = [f"Here are {min(len(cards),3)} cafes near ({payload['origin']['lat']}, {payload['origin']['lng']}):\n"]
+        for i, c in enumerate(cards[:3], 1):
+            lines.append(
+                f"{i}. **{c['name']}**\n"
+                f"   - ~{c['distance_km']} km, {c['duration_min']} min on foot\n"
+                f"   - [Map]({c['map_url']})\n"
+            )
+        return "\n".join(lines)
 
     # 3) Second call with the assistant tool_calls + tool outputs
     follow = client.chat.completions.create(
