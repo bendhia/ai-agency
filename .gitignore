@@ -28,3 +28,5 @@ Library/
 .nvm/
 Library/
 .DS_Store
+
+path/to/that/nested/repo/
