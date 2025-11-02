@@ -1,0 +1,27 @@
+# --- macOS ---
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+
+# --- Node / Frontend ---
+node_modules/
+*.log
+
+# --- IDE ---
+.vscode/
+.idea/
+
+# --- Build & caches ---
+dist/
+build/
+.cache/
+
+# --- Misc you definitely don't want ---
+.nvm/
+Library/
