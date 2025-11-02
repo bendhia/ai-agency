@@ -97,7 +97,7 @@ async def run_agent(user_msg: str) -> str:
             "name": name,
             "content": json.dumps(out)
         })
-
+        
     # If the model called the composite tool, format a reliable answer ourselves
     only_one = len(assistant_msg.tool_calls) == 1
     if only_one and assistant_msg.tool_calls[0].function.name == "nearby_search_with_walk":
