@@ -1,18 +1,17 @@
 # agent.py
-import os
-import json
-import asyncio
+import os, json, asyncio, re
 from dotenv import load_dotenv
 from openai import OpenAI
 
 # Tools
 from tools.geo import (
     nominatim_search,
-    osrm_walking_time,          # legacy single-route tool (still supported)
-    nearby_search_with_walk,    # composite tool (supports mode)
+    osrm_walking_time,          # kept for compatibility
+    nearby_search_with_walk,    # composite nearby (supports mode)
 )
 from tools.wiki import wikipedia_summary
-from tools.human import ask_human  # in-terminal clarification tool
+from tools.human import ask_human
+from tools.travel import plan_trip
 
 # ---------- config ----------
 load_dotenv()
@@ -25,6 +24,15 @@ except ValueError:
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Coord auto-parser (helps the model include origin_lat/lng)
+COORD_RE = re.compile(r"(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)")
+def _extract_coords(text: str):
+    m = COORD_RE.search(text or "")
+    if not m:
+        return None
+    lat, lng = float(m.group(1)), float(m.group(2))
+    return lat, lng
 
 # ---------- tools schema for function calling ----------
 TOOLS = [
@@ -76,7 +84,7 @@ TOOLS = [
             },
         },
     },
-    # Composite tool (supports mode)
+    # Composite nearby tool
     {
         "type": "function",
         "function": {
@@ -116,53 +124,92 @@ TOOLS = [
             },
         },
     },
+    # Trip planner tool
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_trip",
+            "description": "Create a day-by-day itinerary for a destination with optional dates, interests, and mode.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "destination": {"type": "string"},
+                    "start_date": {"type": "string", "description": "YYYY-MM-DD (optional)"},
+                    "end_date": {"type": "string", "description": "YYYY-MM-DD (optional)"},
+                    "interests": {"type": "array", "items": {"type": "string"}},
+                    "pace": {"type": "string", "enum": ["relaxed","moderate","intense"], "default": "moderate"},
+                    "mode": {"type": "string", "enum": ["foot","bike","driving"], "default": "foot"},
+                    "origin_lat": {"type": "number"},
+                    "origin_lng": {"type": "number"},
+                    "limit_per_day": {"type": "integer", "default": 4}
+                },
+                "required": ["destination"]
+            }
+        }
+    },
 ]
 
 SYSTEM = (
-    "You are a travel/concierge agent. When the user asks for places near coordinates, cafes, landmarks, or "
-    "distances, you MUST call tools and NEVER guess. "
-    "If the tool returns fields like distance_km and duration_min, display those values verbatim. "
-    "If the request is ambiguous or missing key constraints (e.g., category, radius, budget, time, mode), "
-    "you MUST call ask_human to clarify and wait for the answer before continuing. "
-    "Do NOT ask clarifying questions as plain assistant messages; ALWAYS use the ask_human tool for every clarification."
+    "You are a travel/concierge agent. When the user asks for nearby places or trip planning, "
+    "you MUST call tools and NEVER guess. "
+    "If a tool returns distance_km / duration_min, display those verbatim. "
+    "If the request is ambiguous (missing destination, dates, interests, mode, radius, origin coords), "
+    "call ask_human to clarify and wait for the answer. "
+    "If the user provides destination, dates and interests, you MUST call plan_trip. "
+    "If the user message contains coordinates, ensure plan_trip includes origin_lat/origin_lng. "
+    "Do NOT output empty assistant messages. If uncertain, call ask_human again."
 )
+
 
 def _looks_like_a_question(text: str) -> bool:
     if not text:
         return False
     t = text.strip().lower()
-    # heuristic: a short line that ends with '?' or starts with wh-words
     return ("?" in t) or t.startswith(("what ", "which ", "where ", "when ", "how ", "do you ", "are you "))
 
-# ---------- agent (interactive loop) ----------
+# ---------- agent ----------
 async def run_agent(user_msg: str) -> str:
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user_msg}]
 
+    # auto-nudge: if message contains coords, cache them and tell the model it can reuse
+    orig = _extract_coords(user_msg)
+    if orig:
+        messages.append({
+            "role": "system",
+            "content": f"If you call plan_trip and origin_lat/lng are missing, use origin_lat={orig[0]} and origin_lng={orig[1]} extracted from the user message."
+        })
+
     # Limit steps to prevent infinite loops
-    for _ in range(8):
-        # 1) Ask the model what to do next
-        first = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=TEMPERATURE,
-        )
+    for _ in range(12):
+        try:
+            first = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=TEMPERATURE,
+            )
+        except Exception as e:
+            return f"Network error contacting OpenAI ({type(e).__name__}): {e}"
+
         assistant_msg = first.choices[0].message
         if DEBUG:
             print("DEBUG tool_calls:", getattr(assistant_msg, "tool_calls", None))
             print("DEBUG assistant content:", assistant_msg.content)
 
-        # A) If the model requested tool(s), run them all and append results
         if getattr(assistant_msg, "tool_calls", None):
             messages.append(assistant_msg)
-
             tool_messages = []
+
             for tc in assistant_msg.tool_calls:
                 name = tc.function.name
                 args = json.loads(tc.function.arguments)
-                if DEBUG:
-                    print("DEBUG calling tool:", name, args)
+                if DEBUG: print("DEBUG calling tool:", name, args)
+
+                # --- inject origin if missing for plan_trip ---
+                if name == "plan_trip" and orig:
+                    if args.get("origin_lat") is None or args.get("origin_lng") is None:
+                        args["origin_lat"], args["origin_lng"] = orig
 
                 if name == "nominatim_search":
                     out = await nominatim_search(
@@ -188,6 +235,18 @@ async def run_agent(user_msg: str) -> str:
                         args.get("options"),
                         args.get("required", True),
                     )
+                elif name == "plan_trip":
+                    out = await plan_trip(
+                        args["destination"],
+                        args.get("start_date"),
+                        args.get("end_date"),
+                        args.get("interests"),
+                        args.get("pace","moderate"),
+                        args.get("mode","foot"),
+                        args.get("origin_lat"),
+                        args.get("origin_lng"),
+                        args.get("limit_per_day", 4),
+                    )
                 else:
                     out = {"error": f"unknown tool: {name}"}
 
@@ -200,7 +259,7 @@ async def run_agent(user_msg: str) -> str:
                 tool_messages.append(tool_msg)
                 messages.append(tool_msg)
 
-            # 2.5) Short-circuit if only the composite tool was used (deterministic formatting)
+            # Nearby-only short-circuit
             if len(assistant_msg.tool_calls) == 1 and assistant_msg.tool_calls[0].function.name == "nearby_search_with_walk":
                 payload = json.loads(tool_messages[0]["content"])
                 cards = payload.get("cards", [])
@@ -219,13 +278,51 @@ async def run_agent(user_msg: str) -> str:
                     )
                 return "\n".join(lines)
 
-            # Otherwise continue the loop; the next iteration will let the model compose a final answer
+            # Trip-only short-circuit
+            if len(assistant_msg.tool_calls) == 1 and assistant_msg.tool_calls[0].function.name == "plan_trip":
+                payload = json.loads(tool_messages[0]["content"])
+                dest = payload.get("destination") or "Your trip"
+                sd = payload.get("start_date") or "unspecified"
+                ed = payload.get("end_date") or "unspecified"
+                mode = payload.get("mode", "foot")
+
+                itinerary = payload.get("itinerary") or []
+                lines = [f"**Trip plan: {dest}** ({sd} → {ed}) — mode: {mode}\n"]
+
+                if not itinerary:
+                    lines.append("No itinerary items yet. Try adding dates, interests, or a starting location.")
+                else:
+                    for day in itinerary:
+                        date_label = day.get("date") or "Day"
+                        lines.append(f"- {date_label}:")
+                        for it in day.get("items", []):
+                            name = it.get("name") or "Place"
+                            dist = f", ~{it.get('distance_km')} km" if it.get("distance_km") is not None else ""
+                            dur = f", {it.get('duration_min')} min" if it.get("duration_min") is not None else ""
+                            map_url = it.get("map_url") or "#"
+                            lines.append(f"  • **{name}**{dist}{dur} — [Map]({map_url})")
+
+                links = payload.get("links") or {}
+                if links:
+                    flights = links.get("flights")
+                    hotels  = links.get("hotels")
+                    if flights or hotels:
+                        lines.append("")
+                        if flights: lines.append(f"**Flights:** {flights}")
+                        if hotels:  lines.append(f"**Hotels:** {hotels}")
+
+                lines.append("\nTell me to refine by interests, pace, dates, or mode.")
+                return "\n".join(lines)
+
+            continue  # loop again to let the model compose final text if needed
+
+        # No tool calls
+        content = (assistant_msg.content or "").strip()
+        if not content:
+            messages.append({"role": "assistant", "content": ""})
             continue
 
-        # B) No tool calls. If it looks like a question, FORCE a clarification via ask_human, then loop.
-        content = (assistant_msg.content or "").strip()
         if _looks_like_a_question(content):
-            # Ask the user in-terminal, append the answer, and continue the loop
             answer = await ask_human(content, None, True)
             messages.extend([
                 {"role": "assistant", "content": content},
@@ -233,15 +330,11 @@ async def run_agent(user_msg: str) -> str:
             ])
             continue
 
-        # C) Otherwise it's a normal final message
         return content
 
-    # Fallback if loop exceeds steps
     return "Sorry, I couldn't complete the request in time. Please try again with a bit more detail."
 
 if __name__ == "__main__":
     import sys
-    q = " ".join(sys.argv[1:]).strip() or (
-        "Plan me a quick outing near 36.7529, 3.0420."
-    )
+    q = " ".join(sys.argv[1:]).strip() or "Plan me a quick outing near 36.7529, 3.0420."
     print(asyncio.run(run_agent(q)))
