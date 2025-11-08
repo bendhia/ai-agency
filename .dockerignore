@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node / build noise
+node_modules/
+dist/
+build/
+.cache/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets / env
+.env
+.env.*
